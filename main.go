@@ -38,6 +38,8 @@ commands:
                        sandbox, or return to the sandbox that already has it.
   back [id]            Apply the work, destroy the sandbox, and open axon here
                        on the session. What /local in the sandbox does.
+  update               Install the latest commit of the default branch.
+  version              Print the commit this glia was built from.
 
 Without an id, a command uses the newest task.
 `
@@ -133,6 +135,8 @@ func main() {
 		"stop":    stop,
 		"remote":  remote,
 		"back":    back,
+		"update":  updateCommand,
+		"version": versionCommand,
 	}
 	run, ok := commands[os.Args[1]]
 	if !ok {

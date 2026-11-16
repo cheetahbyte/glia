@@ -27,8 +27,10 @@ Create `~/.glia/config.json`:
 Install the command:
 
 ```sh
-go install .
+go install github.com/cheetahbyte/glia@latest
 ```
+
+`glia update` installs the latest commit of the default branch with `go install` and replaces the running binary. It needs Go. `glia version` prints the commit the binary was built from.
 
 A repository can add a `.glia.json` at its root. Every key is optional:
 
