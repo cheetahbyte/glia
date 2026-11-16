@@ -22,6 +22,8 @@ Create `~/.glia/config.json`:
 
 `providers` maps each provider name axon uses in the sandbox to a provider on your soma server. Use the same names as in your local `~/.axon/models.json`, so a session you continue in the sandbox finds its model.
 
+`home` lists files and folders in your home directory that the sandbox's axon should also have, such as instruction files, hooks and skills: `"home": [".axon/AGENTS.md", ".axon/hooks.json", ".agents"]`. The default is `.axon/AGENTS.md`. Every command axon runs in the sandbox can read them.
+
 `idleMinutes` is how long Railway keeps an idle sandbox before it destroys it, along with any work you haven't fetched. The default, 120, is the longest Railway allows.
 
 Install the command:
@@ -44,7 +46,7 @@ A repository can add a `.glia.json` at its root. Every key is optional:
 
 | Key | Meaning |
 | --- | --- |
-| `setup` | A shell command run in the sandbox's copy of the repository before axon starts. If it fails, the task stops and the sandbox is kept. |
+| `setup` | A shell command run in the sandbox's copy of the repository before axon starts. If it fails, the task stops and the sandbox is kept. Without the key, glia picks one from the lock files at the root: `bun install`, `pnpm install`, `yarn install`, `npm ci`, `uv sync`, and the Go version of `go.mod`. `""` runs nothing. |
 | `copy` | Files and folders that git ignores but the work needs, relative to the repository root. They are copied into the sandbox, where every command axon runs can read them. |
 | `ports` | The ports `glia preview` forwards when you name none. |
 
@@ -53,9 +55,9 @@ A repository can add a `.glia.json` at its root. Every key is optional:
 | In axon | What happens |
 | --- | --- |
 | `/remote` | The session moves into a sandbox, and the sandbox's axon opens in the same terminal. Its status line starts with `remote <task>`. |
-| `/remote <prompt>` | The session moves into a sandbox and axon works on the prompt there without a terminal. You get your shell back and can close the machine. Bring it home later with `glia back`. |
+| `/remote <prompt>` | The session moves into a sandbox and axon works on the prompt there without a terminal. Glia shows each step as it happens. If you stay until it finishes, the work comes home as with `/local`. Ctrl+C stops the watching, not the work: you can close the machine, and `glia watch` or `glia back` picks it up later. |
 | `/local` or `/quit`, inside the sandbox | The sandbox's changes land in your working tree, uncommitted. The sandbox is destroyed, and axon opens on your machine on the same session. |
-| Enter, `~`, `.` or closing the terminal, inside the sandbox | You leave; axon keeps running in the sandbox. `/remote` in a local axon in that directory returns to it. |
+| `/detach` or closing the terminal, inside the sandbox | You leave; axon keeps running in the sandbox, also in the middle of a run. `/remote` in a local axon in that directory returns to it. |
 
 If the changes don't fit your working tree any more, the sandbox is kept and glia tells you to merge branch `glia/<id>` instead.
 
@@ -69,6 +71,7 @@ Run these in the repository you want to work on.
 | `glia start` | Copies the repository and opens axon in the sandbox. |
 | `glia start -c ["<prompt>"]` | The same, but continues this directory's latest axon session, so the sandbox knows the conversation so far. Quit the local axon first. `--session <id>` picks another session. |
 | `glia status` | Shows what the task is doing and what it changed. |
+| `glia watch` | Follows a task that works on a prompt until it finishes. Ctrl+C stops the watching, not the work. |
 | `glia attach` | Opens axon in the sandbox. Closing the terminal leaves it running; `glia attach` again returns to it. |
 | `glia preview [port]` | Forwards sandbox ports to this machine until you press Ctrl+C. |
 | `glia fetch` | Brings the work back as branch `glia/<id>`, and the axon session with it. It checks out nothing. |
@@ -76,14 +79,15 @@ Run these in the repository you want to work on.
 | `glia back` | What `/local` does: applies the work, destroys the sandbox, and opens axon here on the session. It refuses while axon still works or is open in the sandbox. |
 | `glia remote` | What `/remote` runs. |
 | `glia stop` | Fetches, then destroys the sandbox. `--discard` skips the fetch. |
-| `glia list` | Lists tasks. |
+| `glia list` | Lists running tasks; `--all` includes stopped ones. |
 
-`start` also takes `--name <id>` and `--model <provider/model>`. The other commands take a task ID and default to the newest task.
+`start` also takes `--name <id>` and `--model <provider/model>`. The other commands take a task ID and default to the newest running task of the directory you are in.
 
 ## How it works
 
 - `start` stores your working tree as a commit under `refs/glia/<id>/base`. Your branch, index and files stay as they are.
 - The sandbox holds the repository at the same path as on your machine, so a continued axon session finds its files.
+- The sandbox's axon gets the look of your `settings.json`, and the check approvals of the repository from your `state.json`, so project checks run there too.
 - The sandbox joins the private network of your soma service. Railway fills in the token and the address by reference, so glia never reads them.
 - `fetch` stores the sandbox's working tree, committed or not, under `refs/glia/<id>/result` and moves branch `glia/<id>` to it.
 - `apply` applies the difference between the two to your working tree. It refuses when the changes don't fit, and you merge the branch instead.

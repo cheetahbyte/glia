@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -24,8 +26,9 @@ commands:
         Copy the current repository into a new sandbox. With a prompt, axon
         works on it there without you; without one, axon opens for you.
         -c continues this directory's latest axon session in the sandbox.
-  list                 Show known tasks.
+  list [--all]         Show running tasks; with --all, stopped ones too.
   status [id]          Show what the task is doing and what it changed.
+  watch [id]           Follow a task that works on a prompt until it finishes.
   attach [id]          Open axon in the sandbox; detaching leaves it running.
   preview [id] [port]  Forward sandbox ports to this machine.
   fetch [id]           Bring the work back as branch glia/<id>, and the axon
@@ -41,7 +44,7 @@ commands:
   update               Install the latest commit of the default branch.
   version              Print the commit this glia was built from.
 
-Without an id, a command uses the newest task.
+Without an id, a command uses the newest running task of this directory.
 `
 
 type config struct {
@@ -52,11 +55,15 @@ type config struct {
 	Providers   map[string]string `json:"providers"`
 	Model       string            `json:"model"`
 	IdleMinutes int               `json:"idleMinutes"`
+	// Home lists files and folders, relative to the home directory, that the
+	// sandbox's axon should also have: instruction files, hooks, skills.
+	Home []string `json:"home"`
 }
 
 // repoConfig is the optional .glia.json at a repository's root.
 type repoConfig struct {
-	Setup string   `json:"setup"`
+	// Setup is nil when the file names none; glia then looks at the lock files.
+	Setup *string  `json:"setup"`
 	Copy  []string `json:"copy"`
 	Ports []string `json:"ports"`
 }
@@ -97,6 +104,8 @@ func (t task) resultRef() string { return "refs/glia/" + t.ID + "/result" }
 const (
 	remoteDir  = "/root/glia"
 	remoteAxon = "/root/bin/axon"
+	// detachPipe is where the remote axon's /detach asks to be left alone.
+	detachPipe = remoteDir + "/detach"
 )
 
 // snapshotScript prints a commit that holds the working tree, including
@@ -128,6 +137,7 @@ func main() {
 		"start":   start,
 		"list":    list,
 		"status":  status,
+		"watch":   watch,
 		"attach":  attach,
 		"preview": preview,
 		"fetch":   fetch,
@@ -144,6 +154,11 @@ func main() {
 		os.Exit(2)
 	}
 	if err := run(os.Args[2:]); err != nil {
+		if current != nil && sandboxGone(err) {
+			current.Stopped = true
+			saveTask(*current)
+			err = fmt.Errorf("the sandbox of task %s no longer exists. Railway destroys a sandbox that sat idle too long, and work that was not fetched is lost with it", current.ID)
+		}
 		fmt.Fprintln(os.Stderr, "glia:", err)
 		os.Exit(1)
 	}
@@ -182,6 +197,9 @@ func loadConfig() (config, error) {
 	}
 	if len(c.Providers) == 0 {
 		return c, fmt.Errorf("%s: \"providers\" is empty", path)
+	}
+	if c.Home == nil {
+		c.Home = []string{".axon/AGENTS.md"}
 	}
 	return c, nil
 }
@@ -252,7 +270,26 @@ func pickTask(args []string) (task, error) {
 	if len(tasks) == 0 {
 		return task{}, errors.New("no tasks yet")
 	}
+	// Prefer a running task of this directory, then any running task.
+	cwd, _ := os.Getwd()
+	for _, here := range []bool{true, false} {
+		for i := len(tasks) - 1; i >= 0; i-- {
+			t := tasks[i]
+			inRepo := cwd == t.Repo || strings.HasPrefix(cwd, t.Repo+string(filepath.Separator))
+			if !t.Stopped && (!here || inRepo) {
+				return t, nil
+			}
+		}
+	}
 	return tasks[len(tasks)-1], nil
+}
+
+// current is the task the running command works on, for the error report.
+var current *task
+
+func sandboxGone(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "Sandbox is not running") || strings.Contains(msg, "Sandbox not found") || strings.Contains(msg, "has been destroyed")
 }
 
 func taskAndConfig(args []string) (task, config, error) {
@@ -260,6 +297,7 @@ func taskAndConfig(args []string) (task, config, error) {
 	if err != nil {
 		return t, config{}, err
 	}
+	current = &t
 	if t.Stopped {
 		return t, config{}, fmt.Errorf("task %s is stopped", t.ID)
 	}
@@ -407,27 +445,44 @@ func launch(o launchOptions) error {
 		}
 	}
 	models, _ := json.Marshal(map[string]any{"providers": providers})
-	settings, _ := json.Marshal(map[string]string{"defaultModel": chosenModel})
-	for _, f := range []struct{ path, local string }{{remoteAxon, axon}, {remoteDir + "/in.bundle", bundle}} {
-		file, err := os.Open(f.local)
-		if err != nil {
-			return err
-		}
-		err = r.put(t.Sandbox, f.path, file)
-		file.Close()
-		if err != nil {
+	up := newArchive()
+	for name, data := range map[string][]byte{
+		"root/.axon/models.json":   models,
+		"root/.axon/settings.json": sandboxSettings(chosenModel),
+		"root/.axon/state.json":    sandboxState(repo),
+		"root/glia/prompt":         []byte(prompt),
+		"root/glia/sid":            []byte(t.Session),
+	} {
+		if err := up.bytes(name, data); err != nil {
 			return err
 		}
 	}
-	for path, content := range map[string]string{
-		"/root/.axon/models.json":   string(models),
-		"/root/.axon/settings.json": string(settings),
-		remoteDir + "/prompt":       prompt,
-		remoteDir + "/sid":          t.Session,
-	} {
-		if err := r.put(t.Sandbox, path, strings.NewReader(content)); err != nil {
+	userHome, _ := os.UserHomeDir()
+	trees := [][2]string{{"root/bin/axon", axon}, {"root/glia/in.bundle", bundle}}
+	for _, name := range c.Home {
+		if !filepath.IsLocal(name) {
+			return fmt.Errorf("config: %q in \"home\" is not a path inside the home directory", name)
+		}
+		trees = append(trees, [2]string{"root/" + filepath.ToSlash(name), filepath.Join(userHome, name)})
+	}
+	for _, name := range rc.Copy {
+		if !filepath.IsLocal(name) {
+			return fmt.Errorf(".glia.json: %q in \"copy\" is not a path inside the repository", name)
+		}
+		trees = append(trees, [2]string{strings.TrimPrefix(filepath.ToSlash(filepath.Join(repo, name)), "/"), filepath.Join(repo, name)})
+	}
+	if t.Session != "" {
+		for _, name := range sessionPaths(cwd, sessionFile, t.Session) {
+			trees = append(trees, [2]string{"root/.axon/sessions/" + filepath.ToSlash(name), filepath.Join(axonHome(), "sessions", name)})
+		}
+	}
+	for _, tree := range trees {
+		if err := up.tree(tree[0], tree[1]); err != nil {
 			return err
 		}
+	}
+	if err := up.send(r, t.Sandbox); err != nil {
+		return err
 	}
 	userName, _ := git(repo, "config", "user.name")
 	userEmail, _ := git(repo, "config", "user.email")
@@ -446,21 +501,13 @@ func launch(o launchOptions) error {
 	if _, err := r.exec(t.Sandbox, nil, setup); err != nil {
 		return err
 	}
-	if len(rc.Copy) > 0 {
-		step("copy %s", strings.Join(rc.Copy, ", "))
-		if err := r.putTar(t.Sandbox, repo, repo, rc.Copy); err != nil {
-			return err
-		}
+	setupCommand := detectSetup(repo)
+	if rc.Setup != nil {
+		setupCommand = *rc.Setup
 	}
-	if t.Session != "" {
-		step("copy axon session %s", t.Session)
-		if err := r.putTar(t.Sandbox, "/root/.axon/sessions", filepath.Join(axonHome(), "sessions"), sessionPaths(cwd, sessionFile, t.Session)); err != nil {
-			return err
-		}
-	}
-	if rc.Setup != "" {
-		step("set up: %s", rc.Setup)
-		if _, err := r.exec(t.Sandbox, nil, "cd "+quote(repo)+" && { "+rc.Setup+"\n} >"+remoteDir+"/setup.log 2>&1 || { tail -n 15 "+remoteDir+"/setup.log >&2; exit 1; }"); err != nil {
+	if setupCommand != "" {
+		step("set up: %s", setupCommand)
+		if _, err := r.exec(t.Sandbox, nil, "cd "+quote(repo)+" && { "+setupCommand+"\n} >"+remoteDir+"/setup.log 2>&1 || { tail -n 15 "+remoteDir+"/setup.log >&2; exit 1; }"); err != nil {
 			return fmt.Errorf("setup failed, sandbox kept as task %s: %w", t.ID, err)
 		}
 	}
@@ -484,7 +531,11 @@ func launch(o launchOptions) error {
 	if _, err := r.run(nil, r.args([]string{"exec", "--id", t.Sandbox, "--detach"}, "--", work)); err != nil {
 		return err
 	}
-	fmt.Printf("task %s is running in the sandbox; you can close this machine.\ncheck it with:  glia status %s\nbring it home:  glia back %s\n", t.ID, t.ID, t.ID)
+	if isTerminal(os.Stdout) {
+		step("axon is working in the sandbox; Ctrl+C stops watching, not the work")
+		return watchTask(t, c, o.home)
+	}
+	fmt.Printf("task %s is running in the sandbox; you can close this machine.\nwatch it:       glia watch %s\nbring it home:  glia back %s\n", t.ID, t.ID, t.ID)
 	return nil
 }
 
@@ -517,6 +568,7 @@ func remote(args []string) error {
 			if err := saveTask(t); err != nil {
 				return err
 			}
+			step("the sandbox of task %s no longer exists; starting a new one", t.ID)
 			continue
 		}
 		step("task %s already holds this session", t.ID)
@@ -526,11 +578,18 @@ func remote(args []string) error {
 }
 
 func list(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	all := fs.Bool("all", false, "include stopped tasks")
+	fs.Parse(args)
 	tasks, err := loadTasks()
 	if err != nil {
 		return err
 	}
+	shown := 0
 	for _, t := range tasks {
+		if t.Stopped && !*all {
+			continue
+		}
 		state := "running, work not fetched"
 		switch {
 		case t.Stopped:
@@ -539,8 +598,92 @@ func list(args []string) error {
 			state = "running, fetched " + t.Fetched.Format("15:04")
 		}
 		fmt.Printf("%s  %s  %s  %s\n", t.ID, t.Created.Format("2006-01-02 15:04"), filepath.Base(t.Repo), state)
+		shown++
+	}
+	if shown == 0 && !*all {
+		fmt.Println("no running tasks (glia list --all shows stopped ones)")
 	}
 	return nil
+}
+
+func watch(args []string) error {
+	t, c, err := taskAndConfig(args)
+	if err != nil {
+		return err
+	}
+	return watchTask(t, c, false)
+}
+
+// watchTask prints the steps of a task that works on a prompt until it
+// finishes. Ctrl+C stops watching, not the task. With home set, it brings
+// the session back to this machine once the task has finished.
+func watchTask(t task, c config, home bool) error {
+	r := railway{c}
+	script := strings.Join([]string{
+		"[ -s " + remoteDir + "/prompt ] || { echo NOPROMPT; exit 0; }",
+		"touch " + remoteDir + "/log",
+		"tail -n +1 -f " + remoteDir + "/log & tp=$!",
+		"while [ ! -f " + remoteDir + "/exit ]; do sleep 1; done",
+		"sleep 1; kill $tp 2>/dev/null",
+		"echo; python3 -c 'import json;print(json.load(open(\"" + remoteDir + "/result.json\"))[\"final_output\"])' 2>/dev/null",
+		"echo GLIA_EXIT=$(cat " + remoteDir + "/exit)",
+	}, "\n")
+	cmd := exec.Command("railway", r.args([]string{"exec", "--id", t.Sandbox}, "--", script)...)
+	// Ctrl+C ends the watching only: glia stops the railway child and says what to do next.
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+	var errOut bytes.Buffer
+	cmd.Stderr = &errOut
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-interrupts:
+			cmd.Process.Kill()
+		case <-done:
+		}
+	}()
+	finished, noPrompt := false, false
+	lines := bufio.NewScanner(out)
+	lines.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for lines.Scan() {
+		line := lines.Text()
+		switch {
+		case line == "NOPROMPT":
+			noPrompt = true
+		case strings.HasPrefix(line, "GLIA_EXIT="):
+			finished = true
+			if code := strings.TrimPrefix(line, "GLIA_EXIT="); code != "0" {
+				fmt.Printf("axon ended with exit status %s\n", code)
+			}
+		case strings.HasPrefix(line, "tool: "):
+			fmt.Println("  " + strings.TrimPrefix(line, "tool: "))
+		default:
+			fmt.Println(line)
+		}
+	}
+	runErr := cmd.Wait()
+	switch {
+	case noPrompt:
+		return fmt.Errorf("task %s works on no prompt; open it with glia attach %s", t.ID, t.ID)
+	case !finished:
+		if runErr != nil && sandboxGone(errors.New(errOut.String())) {
+			return errors.New(lastLines(errOut.String(), 3))
+		}
+		fmt.Printf("\ntask %s keeps working in the sandbox; you can close this machine.\nwatch it again:  glia watch\nbring it home:   glia back\n", t.ID)
+		return nil
+	case !home:
+		return nil
+	}
+	return backTask(t, c)
 }
 
 func status(args []string) error {
@@ -603,26 +746,63 @@ func attachTask(t task, c config, home bool) error {
 			"cd " + quote(t.remoteCwd()),
 			`echo "$RAILWAY_DURABLE_SESSION_NAME" > ` + remoteDir + "/session",
 			"[ -s " + sid + " ] || python3 -c 'import json;print(json.load(open(\"" + remoteDir + "/result.json\"))[\"session_id\"])' > " + sid + " 2>/dev/null",
-			"export AXON_REMOTE=" + quote(t.ID),
+			"export AXON_REMOTE=" + quote(t.ID) + " AXON_DETACH=" + detachPipe,
+			"rm -f " + detachPipe + "; mkfifo " + detachPipe,
 			"if [ -s " + sid + " ]; then " + remoteAxon + ` --resume "$(cat ` + sid + `)"; elif [ -n "$(ls -A /root/.axon/sessions 2>/dev/null)" ]; then ` + remoteAxon + " -c; else " + remoteAxon + "; fi",
 			"rm -f " + remoteDir + "/session",
 		}, "; "))
 	}
 	cmd := exec.Command("railway", sshArgs...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	runErr := cmd.Run()
-	if !home {
-		return runErr
+	if err := cmd.Start(); err != nil {
+		return err
 	}
+	// The remote axon's /detach writes to a pipe in the sandbox. This second
+	// connection waits on it and then ends the first one from this side.
+	waiter := exec.Command("railway", r.args([]string{"exec", "--id", t.Sandbox}, "--", "while [ ! -p "+detachPipe+" ]; do sleep 0.2; done; cat "+detachPipe)...)
+	if out, err := waiter.StdoutPipe(); err == nil && waiter.Start() == nil {
+		go func() {
+			said, _ := io.ReadAll(out)
+			if strings.Contains(string(said), "detach") {
+				endConnection(cmd.Process.Pid)
+			}
+		}()
+		defer func() {
+			waiter.Process.Kill()
+			waiter.Wait()
+		}()
+	}
+	runErr := cmd.Wait()
 	state, err = remoteState(t, r)
 	if err != nil {
 		return err
 	}
 	if state != "" {
+		// The remote axon never got to restore the terminal.
+		os.Stdout.WriteString("\x1b[?2026l\x1b[?1006l\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[0m\x1b[?25h\x1b[?1049l\x1b]7501;app=axon:state=clear\x1b\\")
 		fmt.Printf("axon keeps running in the sandbox as task %s.\nreturn to it:   /remote in axon, or glia attach %s\nbring it home:  /local in the sandbox, or glia back %s\n", t.ID, t.ID, t.ID)
 		return nil
 	}
+	if !home {
+		return runErr
+	}
 	return backTask(t, c)
+}
+
+// endConnection ends the SSH connection that the railway command with this
+// process id runs, so SSH restores the terminal itself.
+func endConnection(railwayPid int) {
+	out, _ := exec.Command("pgrep", "-P", fmt.Sprint(railwayPid)).Output()
+	ended := false
+	for _, field := range strings.Fields(string(out)) {
+		var pid int
+		if _, err := fmt.Sscan(field, &pid); err == nil && syscall.Kill(pid, syscall.SIGTERM) == nil {
+			ended = true
+		}
+	}
+	if !ended {
+		syscall.Kill(railwayPid, syscall.SIGTERM)
+	}
 }
 
 func back(args []string) error {
@@ -646,6 +826,7 @@ func back(args []string) error {
 // backTask puts the sandbox's work into the working tree, destroys the
 // sandbox, and opens axon here on the session the sandbox continued.
 func backTask(t task, c config) error {
+	quiet = true
 	if _, err := fetchTask(&t, c); err != nil {
 		return fmt.Errorf("the sandbox is kept: %w", err)
 	}
@@ -660,7 +841,7 @@ func backTask(t task, c config) error {
 	if err := saveTask(t); err != nil {
 		return err
 	}
-	fmt.Printf("sandbox of task %s destroyed\n", t.ID)
+	step("sandbox destroyed")
 	axon, err := exec.LookPath("axon")
 	if err != nil || t.Session == "" || !isTerminal(os.Stdin) || !isTerminal(os.Stdout) {
 		if t.Session != "" {
@@ -699,8 +880,32 @@ func preview(args []string) error {
 	}
 	r := railway{c}
 	cmd := exec.Command("railway", r.args([]string{"forward", "--id", t.Sandbox}, ports...)...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd.Run()
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+	reader, writer := io.Pipe()
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, writer, writer
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		lines := bufio.NewScanner(reader)
+		for lines.Scan() {
+			line := lines.Text()
+			if strings.HasPrefix(line, "Warning: Railway sandboxes") || strings.HasPrefix(line, "Using SSH key") || strings.Contains(line, "Forwarding to sandbox") {
+				continue
+			}
+			if strings.TrimSpace(line) != "" {
+				fmt.Println(strings.TrimSpace(line))
+			}
+		}
+	}()
+	err = cmd.Run()
+	writer.Close()
+	<-done
+	if err != nil && sandboxGone(err) {
+		return err
+	}
+	return nil
 }
 
 func fetch(args []string) error {
@@ -712,11 +917,14 @@ func fetch(args []string) error {
 	return err
 }
 
+// quiet leaves out what only matters to someone who fetches by hand.
+var quiet bool
+
 // fetchTask brings the sandbox's work and axon sessions back. It reports
 // whether the sandbox changed anything.
 func fetchTask(t *task, c config) (bool, error) {
 	r := railway{c}
-	step("snapshot the sandbox")
+	step("fetch the work")
 	script := "cd " + quote(t.remoteRepo()) + "\n" + "c=$(sh -c " + quote(snapshotScript) + ")\n" + strings.Join([]string{
 		`[ -n "$c" ] || exit 1`,
 		// Reuse the last snapshot when nothing changed, so fetching twice gives the same commit.
@@ -733,7 +941,7 @@ func fetchTask(t *task, c config) (bool, error) {
 	out = strings.TrimSpace(out)
 	changed := out != "NOCHANGE"
 	if !changed {
-		fmt.Println("the sandbox changed no files")
+		step("the sandbox changed no files")
 	} else if err := landWork(*t, out); err != nil {
 		return false, err
 	}
@@ -766,9 +974,15 @@ func landWork(t task, encoded string) error {
 	if _, err := git(t.Repo, "-c", "fetch.fsckObjects=true", "fetch", "-q", bundle, "+refs/glia/out:"+t.resultRef()); err != nil {
 		return err
 	}
-	commits, _ := git(t.Repo, "log", "--oneline", t.Base+".."+t.resultRef())
 	stat, _ := git(t.Repo, "diff", "--stat", t.Base, t.resultRef())
-	fmt.Printf("%s\n\n%s\n\n", commits, stat)
+	fmt.Printf("%s\n", stat)
+	if quiet {
+		git(t.Repo, "branch", "-f", t.branch(), t.resultRef())
+		return nil
+	}
+	if commits, _ := git(t.Repo, "log", "--oneline", "--grep", "^glia: uncommitted work$", "--invert-grep", t.Base+".."+t.resultRef()); commits != "" {
+		fmt.Printf("commits made in the sandbox:\n%s\n", commits)
+	}
 	// Move the branch only when it holds nothing but earlier fetched work.
 	current, _ := git(t.Repo, "rev-parse", "-q", "--verify", "refs/heads/"+t.branch())
 	_, notAncestor := git(t.Repo, "merge-base", "--is-ancestor", "refs/heads/"+t.branch(), t.resultRef())
@@ -820,7 +1034,7 @@ func applyWork(t *task) error {
 	if _, err := gitInput(t.Repo, strings.NewReader(patch), "apply"); err != nil {
 		return err
 	}
-	fmt.Println("the sandbox's changes are in the working tree, uncommitted")
+	step("the changes are in your working tree, uncommitted")
 	t.Applied = result
 	return saveTask(*t)
 }

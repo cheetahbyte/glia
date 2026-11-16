@@ -113,11 +113,15 @@ func fetchSessions(t task, r railway) (newest string, err error) {
 			}
 			switch {
 			case readErr != nil:
-				fmt.Printf("new axon session from the sandbox: axon --resume %s\n", id)
+				if !quiet {
+					fmt.Printf("new axon session from the sandbox: axon --resume %s\n", id)
+				}
 			case bytes.Equal(existing, content):
 				continue
 			case bytes.HasPrefix(content, existing):
-				fmt.Printf("axon session continued in the sandbox: axon --resume %s\n", id)
+				if !quiet {
+					fmt.Printf("axon session continued in the sandbox: axon --resume %s\n", id)
+				}
 			default:
 				target = filepath.Join(home(), "tasks", t.ID+"-sessions", rel)
 				fmt.Printf("session %s also changed here, so the sandbox's copy was kept apart: %s\n", id, target)

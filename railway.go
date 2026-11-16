@@ -1,15 +1,11 @@
 package main
 
 import (
-	"archive/tar"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -69,57 +65,6 @@ func (r railway) waitRunning(id string) error {
 
 func (r railway) exec(id string, stdin io.Reader, script string) (string, error) {
 	return r.run(stdin, r.args([]string{"exec", "--id", id}, "--", script))
-}
-
-func (r railway) put(id, path string, content io.Reader) error {
-	_, err := r.exec(id, content, "mkdir -p "+quote(filepath.Dir(path))+" && cat > "+quote(path))
-	return err
-}
-
-// putTar copies the named files and directories, given relative to localRoot,
-// to the same relative paths under remoteRoot. Missing names are skipped.
-func (r railway) putTar(id, remoteRoot, localRoot string, names []string) error {
-	var archive bytes.Buffer
-	w := tar.NewWriter(&archive)
-	for _, name := range names {
-		if !filepath.IsLocal(name) {
-			return fmt.Errorf("%q is not a path inside %s", name, localRoot)
-		}
-		err := filepath.WalkDir(filepath.Join(localRoot, name), func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				if os.IsNotExist(err) {
-					return nil
-				}
-				return err
-			}
-			if !d.Type().IsRegular() {
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			rel, _ := filepath.Rel(localRoot, path)
-			if err := w.WriteHeader(&tar.Header{Name: filepath.ToSlash(rel), Mode: int64(info.Mode().Perm()), Size: info.Size(), ModTime: info.ModTime()}); err != nil {
-				return err
-			}
-			file, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer file.Close()
-			_, err = io.Copy(w, file)
-			return err
-		})
-		if err != nil {
-			return err
-		}
-	}
-	if err := w.Close(); err != nil {
-		return err
-	}
-	_, err := r.exec(id, &archive, "mkdir -p "+quote(remoteRoot)+" && tar -C "+quote(remoteRoot)+" -xf -")
-	return err
 }
 
 func lastLines(s string, n int) string {
