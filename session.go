@@ -3,7 +3,7 @@ package main
 import (
 	"archive/tar"
 	"bytes"
-	"encoding/base64"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -70,17 +70,37 @@ func fetchSessions(t task, r railway) (newest string, err error) {
 		return "", nil
 	}
 	dir := sessionDirName(t.Dir)
-	out, err := r.exec(t.Sandbox, nil, "cd /root/.axon/sessions 2>/dev/null || exit 0\n[ -d "+quote("./"+dir)+" ] || exit 0\ntar -cf - "+quote("./"+dir)+" | base64 -w0")
-	if err != nil {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
 		return "", err
 	}
-	out = strings.TrimSpace(out)
-	if out == "" {
-		return "", nil
-	}
-	archive, err := base64.StdEncoding.DecodeString(out)
+	archivePath := fmt.Sprintf("%s/sessions-%x.tar", remoteDir, nonce)
+	defer func() {
+		if _, err := r.exec(t.Sandbox, nil, "rm -f "+quote(archivePath)); err != nil {
+			step("could not remove the temporary session archive: %v", err)
+		}
+	}()
+	out, err := r.exec(t.Sandbox, nil, strings.Join([]string{
+		"set -e",
+		"if [ ! -d " + quote("/root/.axon/sessions/"+dir) + " ]; then echo GLIA_NO_SESSIONS; exit 0; fi",
+		"mkdir -p " + quote(remoteDir),
+		"cd " + quote("/root/.axon/sessions"),
+		"tar -cf " + quote(archivePath) + " " + quote("./"+dir),
+		"echo GLIA_SESSIONS_READY",
+	}, "\n"))
 	if err != nil {
-		return "", fmt.Errorf("the session archive arrived damaged: %w", err)
+		return "", fmt.Errorf("create the session archive: %w", err)
+	}
+	switch strings.TrimSpace(out) {
+	case "GLIA_NO_SESSIONS":
+		return "", nil
+	case "GLIA_SESSIONS_READY":
+	default:
+		return "", fmt.Errorf("unexpected response while creating the session archive")
+	}
+	archive, err := r.download(t.Sandbox, archivePath)
+	if err != nil {
+		return "", fmt.Errorf("the session archive could not be downloaded: %w", err)
 	}
 	var newestFile string
 	localDir := filepath.Join(axonHome(), "sessions", dir)

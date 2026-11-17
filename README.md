@@ -20,7 +20,9 @@ Create `~/.glia/config.json`:
 }
 ```
 
-`providers` maps each provider name axon uses in the sandbox to a provider on your soma server. Use the same names as in your local `~/.axon/models.json`, so a session you continue in the sandbox finds its model.
+`providers` maps each provider name axon uses in the sandbox to a provider on your soma server. A continued session keeps its model when that provider has a route. Otherwise, glia uses `model` and reports the switch. `--model` overrides both choices. Glia checks that the selected provider has a route before creating a sandbox.
+
+The first sandbox launch explicitly selects that model, including interactive and resumed sessions. Later attachments preserve the sandbox session's model when it has a route. Generated provider settings take precedence over copied home files.
 
 `home` lists files and folders in your home directory that the sandbox's axon should also have, such as instruction files, hooks and skills: `"home": [".axon/AGENTS.md", ".axon/hooks.json", ".agents"]`. The default is `.axon/AGENTS.md`. Every command axon runs in the sandbox can read them.
 
@@ -90,11 +92,12 @@ Run these in the repository you want to work on.
 - The sandbox's axon gets the look of your `settings.json`, and the check approvals of the repository from your `state.json`, so project checks run there too.
 - The sandbox joins the private network of your soma service. Railway fills in the token and the address by reference, so glia never reads them.
 - `fetch` stores the sandbox's working tree, committed or not, under `refs/glia/<id>/result` and moves branch `glia/<id>` to it.
+- Git bundles and session archives download in bounded chunks. Glia verifies their lengths and SHA-256 checksums before importing them. Damaged transfers fail without accepting partial data.
 - `apply` applies the difference between the two to your working tree. It refuses when the changes don't fit, and you merge the branch instead.
 - A session that came back replaces your local copy only when it continues it unchanged. If you also continued it locally, the sandbox's copy is saved under `~/.glia/tasks/<id>-sessions/`.
 
 ## Limits
 
 - Nothing collects the work for you. If you don't fetch within `idleMinutes` after axon finishes, Railway destroys the sandbox and the work is lost.
-- The sandbox's `models.json` holds only the providers from the config. A session that used another provider can't continue there.
+- The sandbox's `models.json` holds only the providers from the config. An unmapped session model needs a routed fallback in `model` or `--model`.
 - Tasks leave `refs/glia/<id>/` and branch `glia/<id>` in your repository. Delete them yourself when you're done.

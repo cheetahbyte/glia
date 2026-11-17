@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -385,12 +384,19 @@ func launch(o launchOptions) error {
 			return err
 		}
 	}
-	chosenModel := *model
-	if chosenModel == "" {
-		chosenModel = c.Model
+	resumedModel := ""
+	if sessionFile != "" {
+		resumedModel, err = sessionModel(filepath.Join(axonHome(), "sessions", sessionDirName(cwd), sessionFile))
+		if err != nil {
+			return err
+		}
 	}
-	if chosenModel == "" {
-		return errors.New("no model: pass --model or set \"model\" in the config")
+	chosenModel, err := sandboxModel(c, *model, resumedModel)
+	if err != nil {
+		return err
+	}
+	if *model == "" && resumedModel != "" && chosenModel != resumedModel {
+		step("session model %s has no Soma route; using %s in the sandbox", resumedModel, chosenModel)
 	}
 
 	step("snapshot %s", repo)
@@ -446,17 +452,6 @@ func launch(o launchOptions) error {
 	}
 	models, _ := json.Marshal(map[string]any{"providers": providers})
 	up := newArchive()
-	for name, data := range map[string][]byte{
-		"root/.axon/models.json":   models,
-		"root/.axon/settings.json": sandboxSettings(chosenModel),
-		"root/.axon/state.json":    sandboxState(repo),
-		"root/glia/prompt":         []byte(prompt),
-		"root/glia/sid":            []byte(t.Session),
-	} {
-		if err := up.bytes(name, data); err != nil {
-			return err
-		}
-	}
 	userHome, _ := os.UserHomeDir()
 	trees := [][2]string{{"root/bin/axon", axon}, {"root/glia/in.bundle", bundle}}
 	for _, name := range c.Home {
@@ -478,6 +473,18 @@ func launch(o launchOptions) error {
 	}
 	for _, tree := range trees {
 		if err := up.tree(tree[0], tree[1]); err != nil {
+			return err
+		}
+	}
+	for name, data := range map[string][]byte{
+		"root/.axon/models.json":   models,
+		"root/.axon/settings.json": sandboxSettings(chosenModel),
+		"root/.axon/state.json":    sandboxState(repo),
+		"root/glia/prompt":         []byte(prompt),
+		"root/glia/sid":            []byte(t.Session),
+		"root/glia/model":          []byte(chosenModel),
+	} {
+		if err := up.bytes(name, data); err != nil {
 			return err
 		}
 	}
@@ -520,14 +527,8 @@ func launch(o launchOptions) error {
 		return nil
 	}
 	step("start axon")
-	ask := remoteAxon + " ask --json"
-	if t.Session != "" {
-		ask += " --resume " + quote(t.Session)
-	}
-	if t.Session == "" || *model != "" {
-		ask += " --model " + quote(chosenModel)
-	}
-	work := "cd " + quote(t.Dir) + " && AXON_REMOTE=" + quote(t.ID) + " " + ask + ` "$(cat ` + remoteDir + `/prompt)" > ` + remoteDir + `/result.json 2> ` + remoteDir + `/log; echo $? > ` + remoteDir + `/exit`
+	ask := remoteAsk(t.Session, chosenModel)
+	work := "cd " + quote(t.Dir) + " && AXON_REMOTE=" + quote(t.ID) + " " + ask + ` "$(cat ` + remoteDir + `/prompt)" > ` + remoteDir + `/result.json 2> ` + remoteDir + `/log; status=$?; echo "$status" > ` + remoteDir + `/exit; if [ "$status" -eq 0 ]; then rm -f ` + remoteDir + `/model; fi`
 	if _, err := r.run(nil, r.args([]string{"exec", "--id", t.Sandbox, "--detach"}, "--", work)); err != nil {
 		return err
 	}
@@ -741,14 +742,19 @@ func attachTask(t task, c config, home bool) error {
 	if state != "" {
 		sshArgs = append(sshArgs, "--session", state)
 	} else {
+		model, err := remoteModel(t, r)
+		if err != nil {
+			return err
+		}
 		sid := remoteDir + "/sid"
+		axon := remoteAxon + " --model " + quote(model)
 		sshArgs = append(sshArgs, "--", strings.Join([]string{
 			"cd " + quote(t.remoteCwd()),
 			`echo "$RAILWAY_DURABLE_SESSION_NAME" > ` + remoteDir + "/session",
 			"[ -s " + sid + " ] || python3 -c 'import json;print(json.load(open(\"" + remoteDir + "/result.json\"))[\"session_id\"])' > " + sid + " 2>/dev/null",
 			"export AXON_REMOTE=" + quote(t.ID) + " AXON_DETACH=" + detachPipe,
 			"rm -f " + detachPipe + "; mkfifo " + detachPipe,
-			"if [ -s " + sid + " ]; then " + remoteAxon + ` --resume "$(cat ` + sid + `)"; elif [ -n "$(ls -A /root/.axon/sessions 2>/dev/null)" ]; then ` + remoteAxon + " -c; else " + remoteAxon + "; fi",
+			"if [ -s " + sid + " ]; then " + axon + ` --resume "$(cat ` + sid + `)"; elif [ -n "$(ls -A /root/.axon/sessions 2>/dev/null)" ]; then ` + axon + " -c; else " + axon + "; fi && rm -f " + remoteDir + "/model",
 			"rm -f " + remoteDir + "/session",
 		}, "; "))
 	}
@@ -925,14 +931,14 @@ var quiet bool
 func fetchTask(t *task, c config) (bool, error) {
 	r := railway{c}
 	step("fetch the work")
-	script := "cd " + quote(t.remoteRepo()) + "\n" + "c=$(sh -c " + quote(snapshotScript) + ")\n" + strings.Join([]string{
+	script := "set -e\ncd " + quote(t.remoteRepo()) + "\n" + "c=$(sh -c " + quote(snapshotScript) + ")\n" + strings.Join([]string{
 		`[ -n "$c" ] || exit 1`,
 		// Reuse the last snapshot when nothing changed, so fetching twice gives the same commit.
 		`if prev=$(git rev-parse -q --verify refs/glia/out) && [ "$c" != "$(git rev-parse HEAD)" ] && [ "$(git rev-parse "$prev^")" = "$(git rev-parse HEAD)" ] && [ "$(git rev-parse "$prev^{tree}")" = "$(git rev-parse "$c^{tree}")" ]; then c=$prev; fi`,
 		`git update-ref refs/glia/out "$c"`,
 		`if [ "$c" = ` + t.Base + ` ]; then echo NOCHANGE; exit 0; fi`,
 		"git bundle create -q " + remoteDir + "/out.bundle refs/glia/out ^" + t.Base,
-		"base64 -w0 " + remoteDir + "/out.bundle",
+		"echo BUNDLE_READY",
 	}, "\n")
 	out, err := r.exec(t.Sandbox, nil, script)
 	if err != nil {
@@ -942,8 +948,17 @@ func fetchTask(t *task, c config) (bool, error) {
 	changed := out != "NOCHANGE"
 	if !changed {
 		step("the sandbox changed no files")
-	} else if err := landWork(*t, out); err != nil {
-		return false, err
+	} else {
+		if out != "BUNDLE_READY" {
+			return false, errors.New("the sandbox did not confirm that its work bundle is ready")
+		}
+		bundle, err := r.download(t.Sandbox, remoteDir+"/out.bundle")
+		if err != nil {
+			return false, fmt.Errorf("download work bundle: %w", err)
+		}
+		if err := landWork(*t, bundle); err != nil {
+			return false, err
+		}
 	}
 	newest, err := fetchSessions(*t, r)
 	if err != nil {
@@ -956,11 +971,7 @@ func fetchTask(t *task, c config) (bool, error) {
 	return changed, saveTask(*t)
 }
 
-func landWork(t task, encoded string) error {
-	data, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return fmt.Errorf("the bundle arrived damaged: %w", err)
-	}
+func landWork(t task, data []byte) error {
 	tmp, err := os.MkdirTemp("", "glia-")
 	if err != nil {
 		return err
